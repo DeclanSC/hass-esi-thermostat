@@ -2,7 +2,8 @@ from __future__ import annotations
 
 from datetime import timedelta
 import logging
-from typing import Any, Final
+from typing import Any, Final, Dict
+import asyncio
 
 import requests
 import voluptuous as vol
@@ -43,6 +44,7 @@ class ESIDataUpdateCoordinator(DataUpdateCoordinator):
     """Class to manage ESI API data with configurable update interval."""
 
     def __init__(self, hass: HomeAssistant, email: str, password: str, scan_interval_minutes: int):
+        """Initialize the coordinator."""
         super().__init__(
             hass,
             _LOGGER,
@@ -53,6 +55,7 @@ class ESIDataUpdateCoordinator(DataUpdateCoordinator):
         self.password = password
         self.token: str | None = None
         self.user_id: str | None = None
+        self._pending_updates: Dict[str, int] = {}  # device_id: temperature*10
 
     async def _async_update_data(self) -> dict[str, Any]:
         """Fetch data from API."""
@@ -61,6 +64,12 @@ class ESIDataUpdateCoordinator(DataUpdateCoordinator):
                 await self._async_login()
 
             devices = await self._async_get_devices()
+            
+            # Apply pending updates to device data
+            for device in devices:
+                if device["device_id"] in self._pending_updates:
+                    device["current_temprature"] = self._pending_updates[device["device_id"]]
+            
             return {"devices": devices}
 
         except Exception as err:
@@ -128,7 +137,7 @@ async def async_setup_entry(
             entity = EsiThermostat(
                 coordinator=coordinator,
                 device_id=device["device_id"],
-                name=device.get("device_name", DEFAULT_NAME)
+                name=device_name
             )
             entities.append(entity)
         except KeyError as err:
@@ -164,16 +173,17 @@ class EsiThermostat(CoordinatorEntity, ClimateEntity):
         """Initialize the thermostat."""
         super().__init__(coordinator)
         self._device_id = device_id
-        self._attr_has_entity_name = True
         self._attr_unique_id = f"{DOMAIN}_{device_id}"
+        self._attr_name = name
         self._attr_hvac_mode = HVACMode.HEAT
-        self._attr_name = None
+        self._pending_temperature: float | None = None
+        self._is_setting = False
 
         self._attr_device_info = DeviceInfo(
             identifiers={(DOMAIN, device_id)},
             name=name,
             manufacturer="ESI Heating",
-            model="6 Series Smart Thermostat",
+            model="Smart Thermostat",
         )
 
     @property
@@ -189,6 +199,8 @@ class EsiThermostat(CoordinatorEntity, ClimateEntity):
     @property
     def target_temperature(self) -> float | None:
         """Return the target temperature."""
+        if self._pending_temperature is not None:
+            return self._pending_temperature
         if device := self._get_device():
             try:
                 return float(device["current_temprature"]) / 10
@@ -206,10 +218,39 @@ class EsiThermostat(CoordinatorEntity, ClimateEntity):
         if (temperature := kwargs.get(ATTR_TEMPERATURE)) is None:
             return
 
-        await self.hass.async_add_executor_job(
-            self._set_temperature, temperature
-        )
-        await self.coordinator.async_request_refresh()
+        if self._is_setting:
+            _LOGGER.debug("Already processing a temperature change")
+            return
+
+        self._is_setting = True
+        self._pending_temperature = temperature
+        self.async_write_ha_state()
+
+        try:
+            # Ensure pending updates exists
+            if not hasattr(self.coordinator, '_pending_updates'):
+                self.coordinator._pending_updates = {}
+                
+            # Store pending update
+            self.coordinator._pending_updates[self._device_id] = int(temperature * 10)
+            
+            # Make API call
+            await self.hass.async_add_executor_job(
+                self._set_temperature, temperature
+            )
+            
+            # Force refresh
+            await self.coordinator.async_request_refresh()
+
+        except Exception as err:
+            _LOGGER.error("Error setting temperature: %s", err)
+            self._pending_temperature = None
+            self.async_write_ha_state()
+            raise
+
+        finally:
+            self._is_setting = False
+            self._pending_temperature = None
 
     def _set_temperature(self, temperature: float) -> None:
         """Send temperature setting to API."""
