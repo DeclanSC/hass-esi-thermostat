@@ -88,7 +88,7 @@ class EsiThermostat(CoordinatorEntity, ClimateEntity):
     }
 
     def __init__(self, coordinator, device_id: str, name: str):
-        super().__init__(coordinator)  # ✅ only coordinator goes here
+        super().__init__(coordinator)
         self._device_id = device_id
         self._attr_name = name
         self._attr_unique_id = f"{DOMAIN}_{device_id}"
@@ -157,13 +157,20 @@ class EsiThermostat(CoordinatorEntity, ClimateEntity):
 
     @property
     def hvac_action(self) -> HVACAction | None:
+        """Return the current HVAC action based on th_work field."""
         if self.hvac_mode == HVACMode.OFF:
             return HVACAction.OFF
-        current_temp = self.current_temperature
-        target_temp = self.target_temperature
-        if current_temp is None or target_temp is None:
+
+        device = self._get_device()
+        if not device:
             return HVACAction.IDLE
-        if current_temp < target_temp:
+
+        try:
+            th_work = int(device.get("th_work", 0))
+        except (TypeError, ValueError):
+            th_work = 0
+
+        if th_work == 1:
             return HVACAction.HEATING
         return HVACAction.IDLE
 
@@ -267,10 +274,14 @@ class EsiThermostat(CoordinatorEntity, ClimateEntity):
                 )
             api_temp = int(target_temp * 10)
             await self._send_api_request(work_mode, api_temp)
+
+            # Immediately refresh to get updated state
             await self.coordinator.async_request_refresh()
-            if target_mode == HVACMode.AUTO:
-                await asyncio.sleep(3.0)
-                await self.coordinator.async_request_refresh()
+
+            # Always perform a follow-up refresh after 3 seconds
+            await asyncio.sleep(3.0)
+            await self.coordinator.async_request_refresh()
+
             self._is_mode_change = False
         except Exception as err:
             _LOGGER.error("Update failed: %s", err, exc_info=True)
@@ -357,6 +368,15 @@ class EsiThermostat(CoordinatorEntity, ClimateEntity):
             and self._get_device() is not None
             and self.coordinator.token is not None
         )
+
+    @property
+    def extra_state_attributes(self) -> dict[str, Any]:
+        """Expose extra diagnostic attributes."""
+        attrs = {}
+        if device := self._get_device():
+            if "th_work" in device:
+                attrs["th_work"] = device.get("th_work")
+        return attrs
 
     async def async_will_remove_from_hass(self) -> None:
         if self._update_processor_task:
