@@ -1,20 +1,16 @@
+"""Data update coordinator for ESI Thermostat."""
 from __future__ import annotations
 
 from datetime import timedelta
 import logging
 from typing import Any
 
-import requests
+from esi_controls_async import ESICentroAPI, ESIProtocolError
 
+from homeassistant.helpers.aiohttp_client import async_get_clientsession
 from homeassistant.helpers.update_coordinator import DataUpdateCoordinator, UpdateFailed
+from homeassistant.exceptions import ConfigEntryAuthFailed
 from homeassistant.core import HomeAssistant
-
-from .const import (
-    LOGIN_URL,
-    DEVICE_LIST_URL,
-    CONF_EMAIL,
-    CONF_PASSWORD,
-)
 
 _LOGGER = logging.getLogger(__name__)
 
@@ -37,55 +33,37 @@ class ESIDataUpdateCoordinator(DataUpdateCoordinator):
         )
         self.email = email
         self.password = password
-        self.token: str | None = None
-        self.user_id: str | None = None
+        self.api = ESICentroAPI(session=async_get_clientsession(hass))
 
     async def _async_update_data(self) -> dict[str, Any]:
-        """Fetch data from API."""
+        """Fetch data from API using the PyPI client."""
         try:
-            if not self.token:
-                await self._async_login()
+            if not self.api.available():
+                await self.api.async_login(email=self.email, password=self.password)
 
-            devices = await self._async_get_devices()
+            await self.api.async_update_devices()
+            devices = self.api.get_devices() or []
             return {"devices": devices}
 
+        except ESIProtocolError as err:
+            self.api._auth = None
+            raise ConfigEntryAuthFailed(f"Session expired or invalid credentials: {err}") from err
         except Exception as err:
             _LOGGER.error("Update failed: %s", err, exc_info=True)
-            raise UpdateFailed(f"Error communicating with API: {err}") from err
+            raise UpdateFailed(f"Network error communicating with API: {err}") from err
 
-    async def _async_login(self) -> None:
-        """Authenticate with ESI API."""
-        payload = {
-            "password": self.password,
-            "email": self.email
-        }
+    async def async_set_device_state(self, device_id: str, work_mode: int, temperature: float) -> None:
+        """Send state update to a specific device via the PyPI client."""
+        try:
+            if not self.api.available():
+                await self.api.async_login(email=self.email, password=self.password)
 
-        response = await self.hass.async_add_executor_job(
-            lambda: requests.post(LOGIN_URL, data=payload, timeout=15)
-        )
-        data = response.json()
-
-        if not data.get("statu") or not data.get("user", {}).get("token"):
-            raise UpdateFailed("Login failed")
-
-        self.token = data["user"]["token"]
-        self.user_id = str(data["user"].get("id", ""))
-
-    async def _async_get_devices(self) -> list[dict[str, Any]]:
-        """Retrieve device list from API."""
-        params = {
-            "user_id": self.user_id,
-            "token": self.token,
-            "device_type": 1,
-            "pageSize": 100,
-        }
-
-        response = await self.hass.async_add_executor_job(
-            lambda: requests.post(DEVICE_LIST_URL, params=params, timeout=15)
-        )
-        data = response.json()
-
-        if not data.get("statu") or "devices" not in data:
-            raise UpdateFailed("Device list fetch failed")
-
-        return data["devices"]
+            await self.api.async_set_work_mode(
+                device_id=device_id,
+                work_mode=work_mode,
+                temperature=temperature,
+            )
+        except ESIProtocolError as err:
+            raise ConfigEntryAuthFailed(f"Session expired while setting state: {err}") from err
+        except Exception as err:
+            raise ValueError(f"API error: {err}") from err

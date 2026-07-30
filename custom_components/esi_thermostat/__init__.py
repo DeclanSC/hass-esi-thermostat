@@ -18,7 +18,6 @@ from .const import (
 )
 from .coordinator import ESIDataUpdateCoordinator
 
-# Explicitly declare no YAML config is supported (config entry only)
 CONFIG_SCHEMA = vol.Schema({}, extra=vol.ALLOW_EXTRA)
 
 async def async_setup(hass: HomeAssistant, config: ConfigType) -> bool:
@@ -29,13 +28,11 @@ async def async_setup_entry(hass: HomeAssistant, entry: ConfigEntry) -> bool:
     """Set up ESI Thermostat from a config entry."""
     hass.data.setdefault(DOMAIN, {})
 
-    # Get scan interval from options
     scan_interval_minutes = entry.options.get(
         CONF_SCAN_INTERVAL,
         DEFAULT_SCAN_INTERVAL_MINUTES
     )
 
-    # Initialize coordinator
     coordinator = ESIDataUpdateCoordinator(
         hass,
         entry.data[CONF_EMAIL],
@@ -44,24 +41,17 @@ async def async_setup_entry(hass: HomeAssistant, entry: ConfigEntry) -> bool:
     )
 
     try:
-        # Fetch initial data
         await coordinator.async_config_entry_first_refresh()
     except Exception as err:
         raise ConfigEntryNotReady(f"Failed to initialize: {err}") from err
 
-    # Store coordinator
     hass.data[DOMAIN][entry.entry_id] = {
         "coordinator": coordinator,
         "data": entry.data
     }
 
-    # Forward setup to platforms using async forward
     await hass.config_entries.async_forward_entry_setups(entry, PLATFORMS)
-
-    # Set up options update listener
-    entry.async_on_unload(
-        entry.add_update_listener(async_update_options)
-    )
+    entry.async_on_unload(entry.add_update_listener(async_update_options))
 
     return True
 

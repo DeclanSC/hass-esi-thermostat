@@ -2,12 +2,15 @@
 from __future__ import annotations
 
 from typing import Any
-import requests
+from collections.abc import Mapping
 import voluptuous as vol
+
+from esi_controls_async import ESICentroAPI, ESIProtocolError
 
 from homeassistant import config_entries
 from homeassistant.core import callback
 from homeassistant.data_entry_flow import FlowResult
+from homeassistant.helpers.aiohttp_client import async_get_clientsession
 import homeassistant.helpers.config_validation as cv
 
 from .const import (
@@ -17,7 +20,6 @@ from .const import (
     CONF_SCAN_INTERVAL,
     DEFAULT_NAME,
     DEFAULT_SCAN_INTERVAL_MINUTES,
-    LOGIN_URL,
 )
 
 
@@ -25,10 +27,15 @@ class ESIThermostatConfigFlow(config_entries.ConfigFlow, domain=DOMAIN):
     """Handle a config flow for ESI Thermostat."""
 
     VERSION = 1
+    
+    def __init__(self) -> None:
+        """Initialize the config flow."""
+        self._reauth_email: str | None = None
 
     async def async_step_user(
         self, user_input: dict[str, Any] | None = None
     ) -> FlowResult:
+        """Handle the initial user setup."""
         errors: dict[str, str] = {}
 
         if user_input is not None:
@@ -52,13 +59,12 @@ class ESIThermostatConfigFlow(config_entries.ConfigFlow, domain=DOMAIN):
                             )
                         },
                     )
-
                 errors["base"] = "incorrect_email_or_password"
 
-            except requests.exceptions.RequestException:
-                errors["base"] = "cannot_connect"
+            except ESIProtocolError:
+                errors["base"] = "incorrect_email_or_password"
             except Exception:
-                errors["base"] = "unknown"
+                errors["base"] = "cannot_connect"
 
         return self.async_show_form(
             step_id="user",
@@ -75,22 +81,60 @@ class ESIThermostatConfigFlow(config_entries.ConfigFlow, domain=DOMAIN):
             errors=errors,
         )
 
-    async def _test_credentials(self, email: str, password: str) -> bool:
-        """Test if the provided credentials are valid."""
-        try:
-            response = await self.hass.async_add_executor_job(
-                lambda: requests.post(
-                    LOGIN_URL,
-                    data={"email": email, "password": password},
-                    timeout=10,
+    async def async_step_reauth(self, entry_data: Mapping[str, Any]) -> FlowResult:
+        """Handle reauthentication triggered by the integration."""
+        self.context["title_placeholders"] = {"name": entry_data.get(CONF_EMAIL)}
+        self._reauth_email = entry_data[CONF_EMAIL]
+        return await self.async_step_reauth_confirm()
+
+    async def async_step_reauth_confirm(
+        self, user_input: dict[str, Any] | None = None
+    ) -> FlowResult:
+        """Dialog that prompts the user to enter their new password."""
+        errors: dict[str, str] = {}
+
+        if user_input is not None:
+            try:
+                valid = await self._test_credentials(
+                    self._reauth_email, user_input[CONF_PASSWORD]
                 )
-            )
-            data = response.json()
-            return bool(data.get("statu")) and bool(
-                data.get("user", {}).get("token")
-            )
-        except requests.exceptions.RequestException:
-            return False
+
+                if valid:
+                    entry = self.hass.config_entries.async_get_entry(
+                        self.context["entry_id"]
+                    )
+                    
+                    new_data = dict(entry.data)
+                    new_data[CONF_PASSWORD] = user_input[CONF_PASSWORD]
+                    self.hass.config_entries.async_update_entry(
+                        entry, data=new_data
+                    )
+                    
+                    await self.hass.config_entries.async_reload(entry.entry_id)
+                    return self.async_abort(reason="reauth_successful")
+                
+                errors["base"] = "incorrect_password"
+
+            except ESIProtocolError:
+                errors["base"] = "incorrect_password"
+            except Exception:
+                errors["base"] = "cannot_connect"
+
+        return self.async_show_form(
+            step_id="reauth_confirm",
+            data_schema=vol.Schema(
+                {
+                    vol.Required(CONF_PASSWORD): str,
+                }
+            ),
+            errors=errors,
+        )
+
+    async def _test_credentials(self, email: str, password: str) -> bool:
+        """Test if the provided credentials are valid using the API library."""
+        api = ESICentroAPI(session=async_get_clientsession(self.hass))
+        await api.async_login(email=email, password=password)
+        return api.available()
 
     @staticmethod
     @callback

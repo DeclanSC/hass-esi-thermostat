@@ -1,11 +1,13 @@
 {
   "config": {
     "abort": {
-      "already_configured": "Device is already configured"
+      "already_configured": "Device is already configured",
+      "reauth_successful": "Reauthentication was successful."
     },
     "error": {
       "cannot_connect": "Failed to connect to ESI Thermostat service",
       "incorrect_email_or_password": "Incorrect email or password",
+      "incorrect_password": "The password provided is incorrect.",
       "unknown": "Unknown error occurred"
     },
     "step": {
@@ -16,6 +18,13 @@
           "email": "Email",
           "password": "Password",
           "scan_interval_minutes": "Refresh Interval (minutes)"
+        }
+      },
+      "reauth_confirm": {
+        "title": "Reauthenticate Integration",
+        "description": "The password for {name} is invalid or the session has expired. Please enter the new password.",
+        "data": {
+          "password": "Password"
         }
       }
     }

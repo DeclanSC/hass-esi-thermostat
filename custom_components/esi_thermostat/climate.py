@@ -13,7 +13,7 @@ from homeassistant.components.climate import (
 )
 from homeassistant.config_entries import ConfigEntry
 from homeassistant.const import ATTR_TEMPERATURE, UnitOfTemperature
-from homeassistant.core import HomeAssistant
+from homeassistant.core import HomeAssistant, callback
 from homeassistant.helpers.entity import DeviceInfo
 from homeassistant.helpers.entity_platform import AddEntitiesCallback
 from homeassistant.helpers.update_coordinator import CoordinatorEntity
@@ -28,9 +28,8 @@ from .const import (
     WORK_MODE_AUTO,
     WORK_MODE_AUTO_TEMP_OVERRIDE,
     WORK_MODE_OFF,
-    SET_TEMP_URL,
-    DEFAULT_SCAN_INTERVAL_MINUTES,
 )
+from .coordinator import ESIDataUpdateCoordinator
 
 _LOGGER = logging.getLogger(__name__)
 
@@ -41,7 +40,7 @@ async def async_setup_entry(
     async_add_entities: AddEntitiesCallback,
 ) -> None:
     """Initialize climate platform"""
-    coordinator = hass.data[DOMAIN][entry.entry_id]["coordinator"]
+    coordinator: ESIDataUpdateCoordinator = hass.data[DOMAIN][entry.entry_id]["coordinator"]
 
     if not coordinator.data:
         await coordinator.async_config_entry_first_refresh()
@@ -63,7 +62,7 @@ async def async_setup_entry(
         async_add_entities(entities)
 
 
-class EsiThermostat(CoordinatorEntity, ClimateEntity):
+class EsiThermostat(CoordinatorEntity[ESIDataUpdateCoordinator], ClimateEntity):
     """ESI Thermostat Entity"""
 
     _attr_has_entity_name = False
@@ -87,39 +86,13 @@ class EsiThermostat(CoordinatorEntity, ClimateEntity):
         HVACMode.OFF: WORK_MODE_OFF,
     }
 
-    def __init__(self, coordinator, device_id: str, name: str):
+    def __init__(self, coordinator: ESIDataUpdateCoordinator, device_id: str, name: str):
         super().__init__(coordinator)
         self._device_id = device_id
         self._attr_name = name
         self._attr_unique_id = f"{DOMAIN}_{device_id}"
-
-        # Last known server-confirmed state
-        self._last_confirmed_temp = None
-        self._last_confirmed_mode = None
-        self._last_confirmed_work_mode = None
-
-        # Pending state not yet confirmed by server
-        self._pending_temperature = None
-        self._pending_hvac_mode = None
-
-        # Track if we're changing mode
-        self._is_mode_change = False
-
-        # Queue for serializing updates
-        self._update_queue = asyncio.Queue()
-        self._update_processor_task = asyncio.create_task(self._process_updates())
-
-        # Initialize with current state
-        if device := self._get_device():
-            try:
-                self._last_confirmed_temp = float(device[ATTR_CURRENT_TEMPERATURE]) / 10
-                work_mode = int(device.get(ATTR_WORK_MODE))
-                self._last_confirmed_work_mode = work_mode
-                self._last_confirmed_mode = self.WORK_MODE_TO_HVAC.get(
-                    work_mode, HVACMode.HEAT
-                )
-            except (TypeError, ValueError):
-                pass
+        self._optimistic_target_temp: float | None = None
+        self._optimistic_hvac_mode: HVACMode | None = None
 
         self._attr_device_info = DeviceInfo(
             identifiers={(DOMAIN, device_id)},
@@ -128,32 +101,26 @@ class EsiThermostat(CoordinatorEntity, ClimateEntity):
             model="Smart Thermostat",
         )
 
-    async def _process_updates(self) -> None:
-        """Process update requests sequentially from the queue."""
-        while True:
-            try:
-                await self._update_queue.get()
-                await self._async_perform_update()
-            except asyncio.CancelledError:
-                return
-            except Exception as e:
-                _LOGGER.error("Error processing update: %s", e, exc_info=True)
-            finally:
-                self._update_queue.task_done()
-
     @property
     def hvac_mode(self) -> HVACMode:
-        if self._pending_hvac_mode is not None:
-            return self._pending_hvac_mode
-        if self._last_confirmed_mode is not None:
-            return self._last_confirmed_mode
-        if device := self._get_device():
+        """Return current HVAC mode with optimistic caching support."""
+        device = self._get_device()
+        real_mode = HVACMode.HEAT
+
+        if device:
             try:
-                work_mode = int(device.get(ATTR_WORK_MODE))
-                return self.WORK_MODE_TO_HVAC.get(work_mode, HVACMode.HEAT)
+                work_mode = int(device.get(ATTR_WORK_MODE, WORK_MODE_MANUAL))
+                real_mode = self.WORK_MODE_TO_HVAC.get(work_mode, HVACMode.HEAT)
             except (TypeError, ValueError):
-                return HVACMode.HEAT
-        return HVACMode.HEAT
+                pass
+
+        if self._optimistic_hvac_mode is not None:
+            if real_mode == self._optimistic_hvac_mode:
+                self._optimistic_hvac_mode = None
+            else:
+                return self._optimistic_hvac_mode
+
+        return real_mode
 
     @property
     def hvac_action(self) -> HVACAction | None:
@@ -167,207 +134,153 @@ class EsiThermostat(CoordinatorEntity, ClimateEntity):
 
         try:
             th_work = int(device.get("th_work", 0))
+            if th_work == 1:
+                return HVACAction.HEATING
         except (TypeError, ValueError):
-            th_work = 0
+            pass
 
-        if th_work == 1:
-            return HVACAction.HEATING
         return HVACAction.IDLE
 
     @property
     def current_temperature(self) -> float | None:
+        """Return the measured room temperature."""
         if device := self._get_device():
-            try:
-                return float(device[ATTR_INSIDE_TEMPERATURE]) / 10
-            except (ValueError, TypeError):
-                return None
+            for key in ("inside_temperature", "inside_temparature", "measured_temperature"):
+                if key in device and device[key] is not None:
+                    try:
+                        val = float(device[key])
+                        temp = val / 10 if val > 50 else val
+                        if 5.0 <= temp <= 35.0:
+                            return temp
+                    except (ValueError, TypeError):
+                        continue
         return None
 
     @property
     def target_temperature(self) -> float | None:
-        if self._pending_temperature is not None:
-            return self._pending_temperature
-        if self._last_confirmed_temp is not None:
-            return self._last_confirmed_temp
-        if device := self._get_device():
-            try:
-                return float(device[ATTR_CURRENT_TEMPERATURE]) / 10
-            except (ValueError, TypeError):
-                return None
-        return None
+        """Return the target setpoint temperature with strict safety bounds and optimistic support."""
+        if self.hvac_mode == HVACMode.OFF:
+            return None
+
+        device = self._get_device()
+        real_target = None
+
+        if device:
+            for key in ("current_temperature", "current_temprature", "target_temperature"):
+                if key in device and device[key] is not None:
+                    try:
+                        val = float(device[key])
+                        parsed = val / 10 if val > 50 else val
+                        # Ensure the target sits within valid hardware range (5°C to 35°C) to filter out placeholder spikes like 50°C
+                        if 5.0 <= parsed <= 35.0:
+                            real_target = parsed
+                            break
+                    except (ValueError, TypeError):
+                        continue
+
+        if self._optimistic_target_temp is not None:
+            if real_target is not None and abs(real_target - self._optimistic_target_temp) < 0.1:
+                self._optimistic_target_temp = None
+            else:
+                return self._optimistic_target_temp
+
+        return real_target
 
     async def async_set_hvac_mode(self, hvac_mode: HVACMode) -> None:
-        self._pending_hvac_mode = hvac_mode
-        self._is_mode_change = True
+        """Set new target hvac mode with immediate optimistic frontend update."""
+        device = self._get_device()
+        current_target = 20.0
+        if device:
+            for key in ("current_temperature", "current_temprature", "target_temperature"):
+                if key in device and device[key] is not None:
+                    try:
+                        val = float(device[key])
+                        parsed = val / 10 if val > 50 else val
+                        if 5.0 <= parsed <= 35.0:
+                            current_target = parsed
+                            break
+                    except (ValueError, TypeError):
+                        continue
+
+        self._optimistic_hvac_mode = hvac_mode
 
         if hvac_mode == HVACMode.OFF:
-            self._pending_temperature = 5.0
-        elif hvac_mode == HVACMode.HEAT:
-            temp = (
-                self._pending_temperature
-                or self._last_confirmed_temp
-                or self.target_temperature
-                or self.current_temperature
-                or 20.0
-            )
-            self._pending_temperature = temp
+            target_temp = current_target
+            work_mode = WORK_MODE_OFF
+            self._optimistic_target_temp = None
+        elif hvac_mode == HVACMode.AUTO:
+            self._optimistic_target_temp = None
+            target_temp = current_target
+            work_mode = WORK_MODE_AUTO
         else:
-            self._pending_temperature = None
+            target_temp = current_target
+            work_mode = WORK_MODE_MANUAL
+            self._optimistic_target_temp = target_temp
 
         self.async_write_ha_state()
-        await self._enqueue_update()
+        await self._async_update_device(work_mode, target_temp, is_auto_switch=(hvac_mode == HVACMode.AUTO))
 
     async def async_set_temperature(self, **kwargs) -> None:
+        """Set new target temperature with immediate optimistic override."""
         if (temperature := kwargs.get(ATTR_TEMPERATURE)) is None:
             return
-        self._pending_temperature = temperature
-        self._is_mode_change = False
+
         current_mode = self.hvac_mode
         if current_mode == HVACMode.OFF:
-            self._pending_hvac_mode = HVACMode.HEAT
-            self._is_mode_change = True
+            work_mode = WORK_MODE_MANUAL
+            self._optimistic_hvac_mode = HVACMode.HEAT
         elif current_mode == HVACMode.AUTO:
-            self._pending_hvac_mode = HVACMode.AUTO
+            work_mode = WORK_MODE_AUTO_TEMP_OVERRIDE
         else:
-            self._pending_hvac_mode = HVACMode.HEAT
+            work_mode = WORK_MODE_MANUAL
+
+        target_temp = float(temperature)
+        
+        self._optimistic_target_temp = target_temp
         self.async_write_ha_state()
-        await self._enqueue_update()
 
-    async def _enqueue_update(self) -> None:
-        try:
-            while not self._update_queue.empty():
-                self._update_queue.get_nowait()
-                self._update_queue.task_done()
-            self._update_queue.put_nowait("update")
-        except Exception as e:
-            _LOGGER.error("Failed to enqueue update: %s", e)
+        await self._async_update_device(work_mode, target_temp, is_auto_switch=False)
 
-    async def _async_perform_update(self) -> None:
+    async def _async_update_device(self, work_mode: int, temperature: float, is_auto_switch: bool = False) -> None:
+        """Centralized method to push updates to the API via the coordinator."""
         try:
-            target_temp = self._pending_temperature
-            target_mode = self._pending_hvac_mode
-            if target_mode is None:
-                return
-            if target_temp is None and target_mode != HVACMode.AUTO:
-                target_temp = (
-                    self._last_confirmed_temp
-                    or self.target_temperature
-                    or self.current_temperature
-                    or 20.0
-                )
-            if target_mode == HVACMode.AUTO and target_temp is None:
-                if device := self._get_device():
-                    try:
-                        target_temp = float(device[ATTR_CURRENT_TEMPERATURE]) / 10
-                    except (TypeError, ValueError):
-                        target_temp = self._last_confirmed_temp or 20.0
-                else:
-                    target_temp = self._last_confirmed_temp or 20.0
-            if target_mode == HVACMode.AUTO:
-                if not self._is_mode_change and self.hvac_mode == HVACMode.AUTO:
-                    work_mode = WORK_MODE_AUTO_TEMP_OVERRIDE
-                else:
-                    work_mode = WORK_MODE_AUTO
+            await self.coordinator.async_set_device_state(
+                self._device_id, work_mode, temperature
+            )
+            
+            if is_auto_switch:
+                await asyncio.sleep(1.5)
+                self._optimistic_target_temp = None
             else:
-                work_mode = self.HVAC_TO_WORK_MODE.get(
-                    target_mode, WORK_MODE_MANUAL
-                )
-            api_temp = int(target_temp * 10)
-            await self._send_api_request(work_mode, api_temp)
+                await self.coordinator.async_request_refresh()
+                await asyncio.sleep(1.5)
 
-            # Immediately refresh to get updated state
             await self.coordinator.async_request_refresh()
 
-            # Always perform a follow-up refresh after 3 seconds
-            await asyncio.sleep(3.0)
-            await self.coordinator.async_request_refresh()
-
-            self._is_mode_change = False
         except Exception as err:
-            _LOGGER.error("Update failed: %s", err, exc_info=True)
-            self._pending_temperature = None
-            self._pending_hvac_mode = None
-            self._is_mode_change = False
+            _LOGGER.error("Failed to update thermostat state: %s", err, exc_info=True)
+            self._optimistic_target_temp = None
+            self._optimistic_hvac_mode = None
             await self.coordinator.async_request_refresh()
 
-    async def _send_api_request(self, work_mode: int, temperature: int) -> None:
-        await self.hass.async_add_executor_job(
-            self._set_work_mode, work_mode, temperature
-        )
-
-    def _set_work_mode(self, work_mode: int, temperature: int) -> None:
-        import requests
-
-        if not self.coordinator.token:
-            raise ValueError("No auth token")
-
-        params = {
-            "device_id": self._device_id,
-            "user_id": self.coordinator.user_id,
-            "current_temprature": temperature,
-            "work_mode": work_mode,
-            "messageId": "261a",
-            "token": self.coordinator.token,
-        }
-        try:
-            response = requests.post(SET_TEMP_URL, params=params, timeout=5)
-            response.raise_for_status()
-            response_data = response.json()
-        except Exception as err:
-            raise ValueError(f"API request failed: {err}") from err
-
-        if not response_data.get("statu"):
-            error_msg = response_data.get("message", "Unknown error")
-            error_code = response_data.get("error_code")
-            if error_code == 7:
-                raise ValueError(f"Work mode change rejected: {error_msg}")
-            else:
-                raise ValueError(f"API error: {response_data}")
-
+    @callback
     def _handle_coordinator_update(self) -> None:
-        device = self._get_device()
-        if not device:
-            super()._handle_coordinator_update()
-            return
-        try:
-            device_temp = float(device[ATTR_CURRENT_TEMPERATURE]) / 10
-            device_work_mode = int(device.get(ATTR_WORK_MODE))
-            device_mode = self.WORK_MODE_TO_HVAC.get(device_work_mode, HVACMode.HEAT)
-            self._last_confirmed_temp = device_temp
-            self._last_confirmed_mode = device_mode
-            self._last_confirmed_work_mode = device_work_mode
-            if (
-                self._pending_temperature is not None
-                and abs(device_temp - self._pending_temperature) < 0.5
-            ):
-                self._pending_temperature = None
-            if (
-                self._pending_hvac_mode is not None
-                and device_mode == self._pending_hvac_mode
-            ):
-                self._pending_hvac_mode = None
-        except (TypeError, ValueError):
-            pass
+        """Handle updated data from the coordinator."""
         self.async_write_ha_state()
-        super()._handle_coordinator_update()
 
     def _get_device(self) -> dict | None:
         return next(
             (
                 d
                 for d in self.coordinator.data.get("devices", [])
-                if d["device_id"] == self._device_id
+                if d.get("device_id") == self._device_id
             ),
             None,
         )
 
     @property
     def available(self) -> bool:
-        return (
-            super().available
-            and self._get_device() is not None
-            and self.coordinator.token is not None
-        )
+        return super().available and self._get_device() is not None
 
     @property
     def extra_state_attributes(self) -> dict[str, Any]:
@@ -377,11 +290,3 @@ class EsiThermostat(CoordinatorEntity, ClimateEntity):
             if "th_work" in device:
                 attrs["th_work"] = device.get("th_work")
         return attrs
-
-    async def async_will_remove_from_hass(self) -> None:
-        if self._update_processor_task:
-            self._update_processor_task.cancel()
-            try:
-                await self._update_processor_task
-            except asyncio.CancelledError:
-                pass
