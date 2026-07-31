@@ -1,7 +1,10 @@
 {
   "domain": "esi_thermostat",
   "name": "ESI Thermostat",
-  "codeowners": ["@DeclanSC", "@j-f-d"],
+  "codeowners": [
+    "@DeclanSC",
+    "@j-f-d"
+  ],
   "config_flow": true,
   "dependencies": [],
   "documentation": "https://github.com/DeclanSC/hass-esi-thermostat/",
@@ -10,5 +13,5 @@
   "requirements": [
     "esi-controls-async>=1.0.1"
   ],
-  "version": "1.4.0"
+  "version": "1.5.0"
 }

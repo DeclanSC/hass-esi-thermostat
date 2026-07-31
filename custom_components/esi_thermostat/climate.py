@@ -1,17 +1,17 @@
 """ESI Thermostat Climate Platform"""
 
 from __future__ import annotations
+
 import asyncio
 import logging
-from typing import Any
+from typing import TYPE_CHECKING, Any
 
 from homeassistant.components.climate import (
     ClimateEntity,
     ClimateEntityFeature,
-    HVACMode,
     HVACAction,
+    HVACMode,
 )
-from homeassistant.config_entries import ConfigEntry
 from homeassistant.const import ATTR_TEMPERATURE, UnitOfTemperature
 from homeassistant.core import HomeAssistant, callback
 from homeassistant.helpers.entity import DeviceInfo
@@ -19,28 +19,63 @@ from homeassistant.helpers.entity_platform import AddEntitiesCallback
 from homeassistant.helpers.update_coordinator import CoordinatorEntity
 
 from .const import (
-    DOMAIN,
-    DEFAULT_NAME,
-    ATTR_INSIDE_TEMPERATURE,
-    ATTR_CURRENT_TEMPERATURE,
     ATTR_WORK_MODE,
-    WORK_MODE_MANUAL,
+    DEFAULT_NAME,
+    DOMAIN,
+    INSIDE_TEMPERATURE_KEYS,
+    MAX_TEMP,
+    MIN_TEMP,
+    RAW_VALUE_SCALE_THRESHOLD,
+    TARGET_TEMPERATURE_KEYS,
+    TEMP_SCALE_DIVISOR,
     WORK_MODE_AUTO,
     WORK_MODE_AUTO_TEMP_OVERRIDE,
+    WORK_MODE_MANUAL,
     WORK_MODE_OFF,
 )
 from .coordinator import ESIDataUpdateCoordinator
 
+if TYPE_CHECKING:
+    from . import ESIConfigEntry
+
 _LOGGER = logging.getLogger(__name__)
+
+
+def _normalize_temperature(raw: Any) -> float | None:
+    """Convert a raw API value to Celsius, filtering out placeholder spikes.
+
+    Some devices report temperature as an integer tenths value (e.g. 215 for
+    21.5C) instead of a float, and the API occasionally returns garbage like
+    50C+ that isn't a real reading. This centralizes that handling so it
+    isn't copy-pasted at every call site.
+    """
+    try:
+        val = float(raw)
+    except (TypeError, ValueError):
+        return None
+
+    temp = val / TEMP_SCALE_DIVISOR if val > RAW_VALUE_SCALE_THRESHOLD else val
+    if MIN_TEMP <= temp <= MAX_TEMP:
+        return temp
+    return None
+
+
+def _extract_temperature(device: dict[str, Any], keys: tuple[str, ...]) -> float | None:
+    """Return the first valid temperature found under any of `keys`."""
+    for key in keys:
+        if key in device and device[key] is not None:
+            if (temp := _normalize_temperature(device[key])) is not None:
+                return temp
+    return None
 
 
 async def async_setup_entry(
     hass: HomeAssistant,
-    entry: ConfigEntry,
+    entry: ESIConfigEntry,
     async_add_entities: AddEntitiesCallback,
 ) -> None:
     """Initialize climate platform"""
-    coordinator: ESIDataUpdateCoordinator = hass.data[DOMAIN][entry.entry_id]["coordinator"]
+    coordinator = entry.runtime_data
 
     if not coordinator.data:
         await coordinator.async_config_entry_first_refresh()
@@ -65,12 +100,16 @@ async def async_setup_entry(
 class EsiThermostat(CoordinatorEntity[ESIDataUpdateCoordinator], ClimateEntity):
     """ESI Thermostat Entity"""
 
-    _attr_has_entity_name = False
-    _attr_supported_features = ClimateEntityFeature.TARGET_TEMPERATURE
+    _attr_has_entity_name = True
+    _attr_supported_features = (
+        ClimateEntityFeature.TARGET_TEMPERATURE
+        | ClimateEntityFeature.TURN_ON
+        | ClimateEntityFeature.TURN_OFF
+    )
     _attr_temperature_unit = UnitOfTemperature.CELSIUS
     _attr_hvac_modes = [HVACMode.HEAT, HVACMode.AUTO, HVACMode.OFF]
-    _attr_min_temp = 5.0
-    _attr_max_temp = 35.0
+    _attr_min_temp = MIN_TEMP
+    _attr_max_temp = MAX_TEMP
     _attr_target_temperature_step = 0.5
 
     WORK_MODE_TO_HVAC = {
@@ -130,7 +169,7 @@ class EsiThermostat(CoordinatorEntity[ESIDataUpdateCoordinator], ClimateEntity):
 
         device = self._get_device()
         if not device:
-            return HVACAction.IDLE
+            return None
 
         try:
             th_work = int(device.get("th_work", 0))
@@ -145,38 +184,17 @@ class EsiThermostat(CoordinatorEntity[ESIDataUpdateCoordinator], ClimateEntity):
     def current_temperature(self) -> float | None:
         """Return the measured room temperature."""
         if device := self._get_device():
-            for key in ("inside_temperature", "inside_temparature", "measured_temperature"):
-                if key in device and device[key] is not None:
-                    try:
-                        val = float(device[key])
-                        temp = val / 10 if val > 50 else val
-                        if 5.0 <= temp <= 35.0:
-                            return temp
-                    except (ValueError, TypeError):
-                        continue
+            return _extract_temperature(device, INSIDE_TEMPERATURE_KEYS)
         return None
 
     @property
     def target_temperature(self) -> float | None:
-        """Return the target setpoint temperature with strict safety bounds and optimistic support."""
+        """Return the target setpoint temperature with optimistic support."""
         if self.hvac_mode == HVACMode.OFF:
             return None
 
         device = self._get_device()
-        real_target = None
-
-        if device:
-            for key in ("current_temperature", "current_temprature", "target_temperature"):
-                if key in device and device[key] is not None:
-                    try:
-                        val = float(device[key])
-                        parsed = val / 10 if val > 50 else val
-                        # Ensure the target sits within valid hardware range (5°C to 35°C) to filter out placeholder spikes like 50°C
-                        if 5.0 <= parsed <= 35.0:
-                            real_target = parsed
-                            break
-                    except (ValueError, TypeError):
-                        continue
+        real_target = _extract_temperature(device, TARGET_TEMPERATURE_KEYS) if device else None
 
         if self._optimistic_target_temp is not None:
             if real_target is not None and abs(real_target - self._optimistic_target_temp) < 0.1:
@@ -189,18 +207,9 @@ class EsiThermostat(CoordinatorEntity[ESIDataUpdateCoordinator], ClimateEntity):
     async def async_set_hvac_mode(self, hvac_mode: HVACMode) -> None:
         """Set new target hvac mode with immediate optimistic frontend update."""
         device = self._get_device()
-        current_target = 20.0
-        if device:
-            for key in ("current_temperature", "current_temprature", "target_temperature"):
-                if key in device and device[key] is not None:
-                    try:
-                        val = float(device[key])
-                        parsed = val / 10 if val > 50 else val
-                        if 5.0 <= parsed <= 35.0:
-                            current_target = parsed
-                            break
-                    except (ValueError, TypeError):
-                        continue
+        current_target = (
+            _extract_temperature(device, TARGET_TEMPERATURE_KEYS) if device else None
+        ) or 20.0
 
         self._optimistic_hvac_mode = hvac_mode
 
@@ -235,7 +244,7 @@ class EsiThermostat(CoordinatorEntity[ESIDataUpdateCoordinator], ClimateEntity):
             work_mode = WORK_MODE_MANUAL
 
         target_temp = float(temperature)
-        
+
         self._optimistic_target_temp = target_temp
         self.async_write_ha_state()
 
@@ -247,13 +256,14 @@ class EsiThermostat(CoordinatorEntity[ESIDataUpdateCoordinator], ClimateEntity):
             await self.coordinator.async_set_device_state(
                 self._device_id, work_mode, temperature
             )
-            
+
+            # Give the vendor API a moment to settle before pulling fresh
+            # state. Previously this refreshed twice for manual set calls
+            # (once here, once unconditionally below) - one refresh is
+            # enough and halves the API calls on every temperature change.
+            await asyncio.sleep(1.5)
             if is_auto_switch:
-                await asyncio.sleep(1.5)
                 self._optimistic_target_temp = None
-            else:
-                await self.coordinator.async_request_refresh()
-                await asyncio.sleep(1.5)
 
             await self.coordinator.async_request_refresh()
 
