@@ -5,7 +5,7 @@ from datetime import timedelta
 import logging
 from typing import TYPE_CHECKING, Any
 
-from esi_controls_async import ESICentroAPI, ESIProtocolError
+from esi_controls_async import ESICentroAPI, ESILoginError, ESIProtocolError
 
 from homeassistant.core import HomeAssistant
 from homeassistant.exceptions import ConfigEntryAuthFailed
@@ -53,13 +53,21 @@ class ESIDataUpdateCoordinator(DataUpdateCoordinator[dict[str, Any]]):
             devices = self.api.get_devices() or []
             return {"devices": devices}
 
+        except ESILoginError as err:
+            # This is the only case that actually means "the email/password
+            # are wrong" - only here should we ask the user to reauth.
+            raise ConfigEntryAuthFailed(f"Invalid ESI credentials: {err}") from err
         except ESIProtocolError as err:
-            # Let the config entry auth flow (reauth) recreate the client on
-            # its own login attempt rather than reaching into the vendor
-            # library's private `_auth` attribute.
-            raise ConfigEntryAuthFailed(
-                f"Session expired or invalid credentials: {err}"
-            ) from err
+            # ESIServerError / ESIDeviceListError / ESINoAuthorization etc.
+            # are raised by the library for timeouts, non-200 responses, and
+            # unparsable JSON too - not just bad credentials. Treating these
+            # as a plain (temporary) update failure instead of
+            # ConfigEntryAuthFailed avoids nagging the user to re-enter a
+            # password that was never actually wrong. The coordinator will
+            # retry on schedule, and since the library clears its own token
+            # internally on these errors, the next attempt logs back in
+            # automatically with the credentials we already have.
+            raise UpdateFailed(f"Error communicating with ESI API: {err}") from err
         except Exception as err:
             # DataUpdateCoordinator already logs UpdateFailed exceptions, so
             # there's no need to _LOGGER.error here too.
@@ -78,9 +86,13 @@ class ESIDataUpdateCoordinator(DataUpdateCoordinator[dict[str, Any]]):
                 work_mode=work_mode,
                 temperature=temperature,
             )
+        except ESILoginError as err:
+            raise ConfigEntryAuthFailed(f"Invalid ESI credentials: {err}") from err
         except ESIProtocolError as err:
-            raise ConfigEntryAuthFailed(
-                f"Session expired while setting state: {err}"
-            ) from err
+            # Transient server/network error, not a credentials problem -
+            # surface it as a normal failure so the entity's error handling
+            # in climate.py rolls back the optimistic state and retries,
+            # rather than kicking off a reauth flow.
+            raise ValueError(f"API error: {err}") from err
         except Exception as err:
             raise ValueError(f"API error: {err}") from err
