@@ -1,3 +1,4 @@
+
 """ESI Thermostat Climate Platform"""
 
 from __future__ import annotations
@@ -42,13 +43,6 @@ _LOGGER = logging.getLogger(__name__)
 
 
 def _normalize_temperature(raw: Any) -> float | None:
-    """Convert a raw API value to Celsius, filtering out placeholder spikes.
-
-    Some devices report temperature as an integer tenths value (e.g. 215 for
-    21.5C) instead of a float, and the API occasionally returns garbage like
-    50C+ that isn't a real reading. This centralizes that handling so it
-    isn't copy-pasted at every call site.
-    """
     try:
         val = float(raw)
     except (TypeError, ValueError):
@@ -106,7 +100,7 @@ class EsiThermostat(CoordinatorEntity[ESIDataUpdateCoordinator], ClimateEntity):
         | ClimateEntityFeature.TURN_ON
         | ClimateEntityFeature.TURN_OFF
     )
-    _attr_temperature_unit = UnitOfTemperature.CELSIUS
+    _attr_native_temperature_unit = UnitOfTemperature.CELSIUS
     _attr_hvac_modes = [HVACMode.HEAT, HVACMode.AUTO, HVACMode.OFF]
     _attr_min_temp = MIN_TEMP
     _attr_max_temp = MAX_TEMP
@@ -181,14 +175,14 @@ class EsiThermostat(CoordinatorEntity[ESIDataUpdateCoordinator], ClimateEntity):
         return HVACAction.IDLE
 
     @property
-    def current_temperature(self) -> float | None:
+    def native_current_temperature(self) -> float | None:
         """Return the measured room temperature."""
         if device := self._get_device():
             return _extract_temperature(device, INSIDE_TEMPERATURE_KEYS)
         return None
 
     @property
-    def target_temperature(self) -> float | None:
+    def native_target_temperature(self) -> float | None:
         """Return the target setpoint temperature with optimistic support."""
         if self.hvac_mode == HVACMode.OFF:
             return None
